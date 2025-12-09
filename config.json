@@ -1,0 +1,7 @@
+{
+  "BACKUP_DIR": "./backup",
+  "SAVE_MEDIA": true,
+  "SAVE_MESSAGES": true,
+  "SAVE_GROUPS": true,
+  "HEADLESS": false
+}
