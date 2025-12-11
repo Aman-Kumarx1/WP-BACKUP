@@ -2,6 +2,7 @@ const { Client, LocalAuth } = require('whatsapp-web.js');
 const fs = require('fs-extra');
 const path = require('path');
 const mime = require('mime-types');
+const QRCode = require('qrcode-terminal');
 const config = require('./config.json');
 
 // --- SETUP ---
@@ -23,21 +24,20 @@ const client = new Client({
 
 // --- EVENTS ---
 
+let lastQRTime = 0;
+
 client.on('qr', (qr) => {
-    // This is the raw QR code data string.
-    console.log('⚡ QR CODE GENERATED!');
-    console.log('👉 QR Data String (Scan Manually):');
-    console.log(qr); // Print the raw string for manual scanning
+    // Display QR code directly in terminal
+    const now = Date.now();
     
-    // You can use an online QR code generator (like 'goqr.me' or similar)
-    // to paste this string and generate the scannable image on your computer.
-    
-    console.log('---');
-    console.log('INSTRUCTIONS:');
-    console.log('1. Copy the long string above.');
-    console.log('2. Open a website like https://www.qr-code-generator.com/ in your browser.');
-    console.log('3. Paste the string into the text box to generate the image.');
-    console.log('4. Scan the generated image with WhatsApp > Linked Devices.');
+    // Only display QR code every 3 seconds to avoid spam
+    if (now - lastQRTime > 3000) {
+        console.clear();
+        console.log('\n⚡ QR CODE GENERATED! Scan with WhatsApp > Linked Devices:\n');
+        QRCode.generate(qr, { small: true });
+        console.log('\n📱 Open WhatsApp > Linked Devices and scan the QR code above\n');
+        lastQRTime = now;
+    }
 });
 
 client.on('ready', async () => {
@@ -50,6 +50,16 @@ client.on('ready', async () => {
 // Real-time Message Listener (Used for both Sync and Real-time)
 client.on('message_create', async (msg) => {
     await processMessage(msg);
+});
+
+// Error event handler
+client.on('error', (error) => {
+    console.error('❌ Client Error:', error.message);
+});
+
+// Disconnected event handler
+client.on('disconnected', () => {
+    console.log('⚠️ Client disconnected. Attempting to reconnect...');
 });
 
 // --- CORE FUNCTIONS ---
@@ -65,17 +75,27 @@ async function processMessage(msg) {
         let filenameBase = chat.id._serialized; // Default: full WhatsApp ID (number@c.us)
         
         if (!chat.isGroup) {
-            const contact = await msg.getContact();
-            // Get the name, or fall back to pushname, or the raw number ID
-            const contactName = contact.name || contact.pushname || contact.id.user; 
-            
-            if (contactName) {
-                // Sanitize the name for use as a safe filename (replaces invalid chars with _)
-                filenameBase = contactName.replace(/[^a-zA-Z0-9_\- ]/g, '_').trim();
+            try {
+                const contact = await msg.getContact();
+                // Get the name, or fall back to pushname, or the raw number ID
+                const contactName = contact.name || contact.pushname || contact.id.user; 
+                
+                if (contactName) {
+                    // Sanitize the name for use as a safe filename (replaces invalid chars with _)
+                    filenameBase = contactName.replace(/[^a-zA-Z0-9_\- ]/g, '_').trim();
+                }
+            } catch (contactErr) {
+                // If contact retrieval fails, use the phone number from the message
+                const phoneNumber = msg.from.split('@')[0];
+                if (phoneNumber && phoneNumber.length > 0) {
+                    filenameBase = phoneNumber;
+                }
+                // Log the contact error but continue processing
+                // console.warn(`⚠️ Contact retrieval error for ${msg.from}:`, contactErr.message);
             }
         } else {
             // For groups, use the group subject/name if available
-            filenameBase = chat.name || chat.id._serialized;
+            filenameBase = (chat.name && chat.name.trim()) || chat.id._serialized;
             filenameBase = filenameBase.replace(/[^a-zA-Z0-9_\- ]/g, '_').trim();
         }
 
@@ -197,4 +217,8 @@ async function checkDuplicate(filePath, msgId) {
     return false;
 }
 
-client.initialize();
+// Initialize the client with error handling
+client.initialize().catch((err) => {
+    console.error('❌ Failed to initialize client:', err.message);
+    process.exit(1);
+});
