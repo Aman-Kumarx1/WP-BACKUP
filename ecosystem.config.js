@@ -1,22 +1,43 @@
 module.exports = {
-  apps : [{
+  // Application Configuration
+  apps: [{
+    name: 'main-app',
     script: 'index.js',
-    watch: '.'
+    watch: '.',
+    env: {
+      NODE_ENV: 'development'
+    },
+    env_production: {
+      NODE_ENV: 'production'
+    }
   }, {
-    script: './service-worker/',
-    watch: ['./service-worker']
+    name: 'service-worker',
+    script: './service-worker/index.js',
+    watch: ['./service-worker'],
+    env_production: {
+      NODE_ENV: 'production'
+    }
   }],
 
-  deploy : {
-    production : {
-      user : 'SSH_USERNAME',
-      host : 'SSH_HOSTMACHINE',
-      ref  : 'origin/master',
-      repo : 'GIT_REPOSITORY',
-      path : 'DESTINATION_PATH',
-      'pre-deploy-local': '',
-      'post-deploy' : 'npm install && pm2 reload ecosystem.config.js --env production',
-      'pre-setup': ''
+  // Deployment Configuration
+  deploy: {
+    production: {
+      // --- LOCAL SERVER SETTINGS ---
+      user: 'amank', // Explicitly set your Windows username
+      host: 'localhost',
+      
+      // --- GITHUB REPOSITORY SETTINGS ---
+      ref: 'origin/main', 
+      // ⚠️ CRITICAL: You must replace this placeholder with your actual SSH Git URL
+      repo: 'git@github.com:Aman-kumarx1/WhatsApp-tool.git', 
+      
+      // 🎯 CRITICAL FIX: Absolute Windows path
+      path: 'C:/Users/amank/pm2-deployments/whatsapp-tool-prod', 
+      
+      // --- HOOKS ---
+      'pre-deploy-local': 'echo "Starting deployment..."', 
+      'post-deploy': 'npm install --production && pm2 reload ecosystem.config.js --env production',
+      'pre-setup': 'npm install -g pm2' 
     }
   }
 };
