@@ -7,6 +7,7 @@ const config = require('./config.json');
 
 // --- SETUP ---
 const client = new Client({
+    // LocalAuth stores session data in the .wwebjs_auth directory
     authStrategy: new LocalAuth(),
     puppeteer: {
         headless: config.HEADLESS,
@@ -27,7 +28,7 @@ const client = new Client({
 let lastQRTime = 0;
 
 client.on('qr', (qr) => {
-    // Display QR code directly in terminal
+    // Display QR code directly in terminal using qrcode-terminal
     const now = Date.now();
     
     // Only display QR code every 3 seconds to avoid spam
@@ -42,7 +43,7 @@ client.on('qr', (qr) => {
 
 client.on('ready', async () => {
     console.log('✅ Client is ready!');
-    console.log('🔄 Starting Synchronization (Filling gaps)...');
+    console.log('🔄 Starting Synchronization (Filling gaps since last log out)...');
     await syncRecentMessages(); // Triggers sync on startup
     console.log('✅ Sync Complete! Listening for new messages...');
 });
@@ -58,11 +59,44 @@ client.on('error', (error) => {
 });
 
 // Disconnected event handler
-client.on('disconnected', () => {
-    console.log('⚠️ Client disconnected. Attempting to reconnect...');
+client.on('disconnected', (reason) => {
+    console.log(`⚠️ Client disconnected. Reason: ${reason}. Attempting to restart...`);
+    // Note: To truly auto-reconnect, you might need a process manager like PM2
 });
 
 // --- CORE FUNCTIONS ---
+
+// 5. Helper: Get a safe, descriptive filename/folder name for the chat
+async function getChatFilenameBase(chat, msgFrom) {
+    let filenameBase = chat.id._serialized; // Default: full WhatsApp ID
+    
+    if (!chat.isGroup) {
+        try {
+            // Use getContactById() with chat.id._serialized (which is the partner's ID)
+            const contact = await client.getContactById(chat.id._serialized);
+            // Get the name, or fall back to pushname, or the raw number ID
+            const contactName = contact.name || contact.pushname || contact.id.user; 
+            
+            if (contactName) {
+                // Sanitize the name for use as a safe filename
+                filenameBase = contactName.replace(/[^a-zA-Z0-9_\- ]/g, '_').trim();
+            }
+        } catch (contactErr) {
+            // If contact retrieval fails, fall back to phone number from the message or chat ID
+            const phoneNumber = msgFrom ? msgFrom.split('@')[0] : chat.id.user;
+            if (phoneNumber && phoneNumber.length > 0) {
+                filenameBase = phoneNumber;
+            }
+            // console.warn(`⚠️ Contact retrieval error for ${chat.id._serialized}:`, contactErr.message);
+        }
+    } else {
+        // For groups, use the group subject/name if available
+        filenameBase = (chat.name && chat.name.trim()) || chat.id._serialized;
+        filenameBase = filenameBase.replace(/[^a-zA-Z0-9_\- ]/g, '_').trim();
+    }
+    return filenameBase;
+}
+
 
 // 1. Universal Message Processor (Handles Text, Media, View Once, and File Naming)
 async function processMessage(msg) {
@@ -72,32 +106,8 @@ async function processMessage(msg) {
         if (chat.isGroup && !config.SAVE_GROUPS) return;
 
         // --- DYNAMIC FILE NAMING LOGIC ---
-        let filenameBase = chat.id._serialized; // Default: full WhatsApp ID (number@c.us)
-        
-        if (!chat.isGroup) {
-            try {
-                const contact = await msg.getContact();
-                // Get the name, or fall back to pushname, or the raw number ID
-                const contactName = contact.name || contact.pushname || contact.id.user; 
-                
-                if (contactName) {
-                    // Sanitize the name for use as a safe filename (replaces invalid chars with _)
-                    filenameBase = contactName.replace(/[^a-zA-Z0-9_\- ]/g, '_').trim();
-                }
-            } catch (contactErr) {
-                // If contact retrieval fails, use the phone number from the message
-                const phoneNumber = msg.from.split('@')[0];
-                if (phoneNumber && phoneNumber.length > 0) {
-                    filenameBase = phoneNumber;
-                }
-                // Log the contact error but continue processing
-                // console.warn(`⚠️ Contact retrieval error for ${msg.from}:`, contactErr.message);
-            }
-        } else {
-            // For groups, use the group subject/name if available
-            filenameBase = (chat.name && chat.name.trim()) || chat.id._serialized;
-            filenameBase = filenameBase.replace(/[^a-zA-Z0-9_\- ]/g, '_').trim();
-        }
+        // Pass msg.from to the helper to ensure we have a fallback phone number
+        const filenameBase = await getChatFilenameBase(chat, msg.from); 
 
         // --- PATH SETUP ---
         const dateStr = new Date(msg.timestamp * 1000).toISOString().split('T')[0];
@@ -166,22 +176,30 @@ async function processMessage(msg) {
         console.error('Error processing message:', error.message);
     }
 }
-// 2. Synchronization Logic
+
+// 2. Synchronization Logic (Modified for Chronological Integrity)
 async function syncRecentMessages() {
     try {
         const chats = await client.getChats();
-        console.log(`📂 Found ${chats.length} active chats. Syncing last ${config.SYNC_LIMIT || 50} messages each...`);
+        
+        // Use 99999 as the reliable default for sync-all
+        const limit = config.SYNC_LIMIT || 99999; 
+        
+        console.log(`📂 Found ${chats.length} active chats. Syncing last ${limit} messages each...`);
 
         for (const chat of chats) {
             if (chat.isGroup && !config.SAVE_GROUPS) continue;
             
-            const limit = config.SYNC_LIMIT || 50; 
-            
             // Fetches messages from the chat history
-            const messages = await chat.fetchMessages({ limit: limit });
+            const messages = await chat.fetchMessages({ 
+                limit: limit,
+                fromMe: true // Include messages sent by me in the sync
+            });
             
-            for (const msg of messages) {
-                await processMessage(msg); // Uses the main processor to save if not duplicate
+            // CRITICAL FIX: messages are returned newest-first. Reverse them to process 
+            // oldest-first, ensuring chronological order in the log file.
+            for (const msg of messages.reverse()) { 
+                await processMessage(msg); // Deduplication handles skipping existing messages
             }
             
             // Small delay to prevent banning/flooding
