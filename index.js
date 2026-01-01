@@ -4,197 +4,154 @@ const path = require('path');
 const mime = require('mime-types');
 const config = require('./config.json');
 
-// --- SETUP ---
+// --- SETTINGS ---
+// Set how many messages to pull per chat. Use Infinity for "Everything", 
+// but be warned: this takes a long time if you have years of history.
+const BACKUP_LIMIT = config.FULL_BACKUP_LIMIT || 1000; 
+
 const client = new Client({
     authStrategy: new LocalAuth(),
     puppeteer: {
         headless: config.HEADLESS,
+        navigationTimeout: 60000,
         args: [
             '--no-sandbox',
             '--disable-setuid-sandbox',
-            '--disable-dev-shm-usage', // Fixes VM memory crashes
-            '--disable-accelerated-2d-canvas',
-            '--no-first-run',
-            '--no-zygote',
+            '--disable-dev-shm-usage',
             '--disable-gpu'
         ]
     }
 });
 
-// --- EVENTS ---
+// --- INITIALIZATION ---
+async function startBackup() {
+    try {
+        console.log('🚀 Starting WhatsApp Client...');
+        await client.initialize();
+    } catch (err) {
+        if (err.message.includes('net::ERR_NETWORK_CHANGED')) {
+            console.log('🔄 Network changed. Retrying in 5s...');
+            setTimeout(startBackup, 5000);
+        } else {
+            console.error('❌ Init Error:', err.message);
+        }
+    }
+}
 
+// --- EVENTS ---
 client.on('qr', (qr) => {
-    // This is the raw QR code data string.
-    console.log('⚡ QR CODE GENERATED!');
-    console.log('👉 QR Data String (Scan Manually):');
-    console.log(qr); // Print the raw string for manual scanning
-    
-    // You can use an online QR code generator (like 'goqr.me' or similar)
-    // to paste this string and generate the scannable image on your computer.
-    
-    console.log('---');
-    console.log('INSTRUCTIONS:');
-    console.log('1. Copy the long string above.');
-    console.log('2. Open a website like https://www.qr-code-generator.com/ in your browser.');
-    console.log('3. Paste the string into the text box to generate the image.');
-    console.log('4. Scan the generated image with WhatsApp > Linked Devices.');
+    console.log('⚡ QR CODE GENERATED! Scan this data:', qr);
 });
 
 client.on('ready', async () => {
     console.log('✅ Client is ready!');
-    console.log('🔄 Starting Synchronization (Filling gaps)...');
-    await syncRecentMessages(); // Triggers sync on startup
-    console.log('✅ Sync Complete! Listening for new messages...');
+    console.log('📦 STARTING FULL ACCOUNT BACKUP...');
+    await runFullAccountBackup();
 });
 
-// Real-time Message Listener (Used for both Sync and Real-time)
 client.on('message_create', async (msg) => {
+    // Keep processing live messages while backup runs or afterwards
     await processMessage(msg);
 });
 
-// --- CORE FUNCTIONS ---
+// --- CORE BACKUP LOGIC ---
 
-// 1. Universal Message Processor (Handles Text, Media, View Once, and File Naming)
+async function runFullAccountBackup() {
+    try {
+        const chats = await client.getChats();
+        console.log(`📂 Found ${chats.length} chats to process.`);
+
+        for (const chat of chats) {
+            // Filter groups based on config
+            if (chat.isGroup && !config.SAVE_GROUPS) continue;
+
+            const chatName = (chat.name || chat.id.user).replace(/[^a-zA-Z0-9_\- ]/g, '_');
+            console.log(`⏳ Backing up: [${chatName}]`);
+
+            try {
+                // This is the heavy lifter: it scrolls back and fetches history
+                const messages = await chat.fetchMessages({ limit: BACKUP_LIMIT });
+                console.log(`📥 Downloaded ${messages.length} messages for ${chatName}.`);
+
+                for (const msg of messages) {
+                    await processMessage(msg);
+                }
+            } catch (err) {
+                console.error(`❌ Failed to fetch history for ${chatName}:`, err.message);
+            }
+
+            // Safety delay to prevent WhatsApp from flagging the account
+            await new Promise(r => setTimeout(r, 2000));
+        }
+
+        console.log('🏁 --- FULL BACKUP OPERATION COMPLETE --- 🏁');
+    } catch (err) {
+        console.error('Fatal Backup Error:', err);
+    }
+}
+
 async function processMessage(msg) {
     try {
         const chat = await msg.getChat();
-        // Check config to see if groups should be backed up
-        if (chat.isGroup && !config.SAVE_GROUPS) return;
-
-        // --- DYNAMIC FILE NAMING LOGIC ---
-        let filenameBase = chat.id._serialized; // Default: full WhatsApp ID (number@c.us)
+        let folderName = (chat.name || chat.id.user).replace(/[^a-zA-Z0-9_\- ]/g, '_').trim();
         
-        if (!chat.isGroup) {
-            const contact = await msg.getContact();
-            // Get the name, or fall back to pushname, or the raw number ID
-            const contactName = contact.name || contact.pushname || contact.id.user; 
-            
-            if (contactName) {
-                // Sanitize the name for use as a safe filename (replaces invalid chars with _)
-                filenameBase = contactName.replace(/[^a-zA-Z0-9_\- ]/g, '_').trim();
-            }
-        } else {
-            // For groups, use the group subject/name if available
-            filenameBase = chat.name || chat.id._serialized;
-            filenameBase = filenameBase.replace(/[^a-zA-Z0-9_\- ]/g, '_').trim();
+        // Path logic
+        const dateFolder = new Date(msg.timestamp * 1000).toISOString().split('T')[0];
+        const chatLogPath = path.join(config.BACKUP_DIR, 'chats', folderName);
+        const mediaPath = path.join(config.BACKUP_DIR, 'media', dateFolder, folderName);
+
+        await fs.ensureDir(chatLogPath);
+
+        // 1. Save Text Data
+        const logFile = path.join(chatLogPath, 'history.json');
+        const isDuplicate = await checkDuplicate(logFile, msg.id.id);
+        
+        if (!isDuplicate) {
+            const entry = {
+                id: msg.id.id,
+                time: new Date(msg.timestamp * 1000).toLocaleString(),
+                sender: msg.author || msg.from,
+                body: msg.body,
+                media: msg.hasMedia
+            };
+            await appendToJson(logFile, entry);
         }
 
-        // --- PATH SETUP ---
-        const dateStr = new Date(msg.timestamp * 1000).toISOString().split('T')[0];
-        
-        // 1. CHAT LOGS: Now saved in a contact-specific folder
-        const contactChatDir = path.join(config.BACKUP_DIR, 'chats', filenameBase); 
-        // 2. MEDIA: Saved in Date/Contact-specific folders
-        const mediaDir = path.join(config.BACKUP_DIR, 'media', dateStr, filenameBase); 
-        
-        await fs.ensureDir(contactChatDir); // Ensure the contact's log folder exists
-
-        // A. Save Text / Log
-        if (config.SAVE_MESSAGES) {
-            // The log file is now 'messages.json' inside the new contact-specific directory
-            const logFile = path.join(contactChatDir, `messages.json`);
-            
-            const isDuplicate = await checkDuplicate(logFile, msg.id.id);
-            
-            if (!isDuplicate) {
-                const messageData = {
-                    id: msg.id.id,
-                    from: msg.from,
-                    to: msg.to,
-                    author: msg.author || msg.from,
-                    body: msg.body,
-                    timestamp: new Date(msg.timestamp * 1000).toISOString(),
-                    hasMedia: msg.hasMedia,
-                    isSentByMe: msg.fromMe,
-                    isViewOnce: msg.isViewOnce || false 
-                };
-                await appendToJson(logFile, messageData);
-                console.log(`📝 Saved Log: ${msg.body.substring(0, 15)}... (${filenameBase})`);
-            }
-        }
-
-        // B. Save Media (Standard & View Once)
-        if (config.SAVE_MEDIA && msg.hasMedia) {
-            
-            if (msg.isViewOnce) {
-                // Log to console when attempting to capture view once media
-                console.log(`💣 VIEW ONCE MEDIA DETECTED! Attempting to capture: ${msg.id.id}`);
-            }
-            
-            try {
-                await fs.ensureDir(mediaDir);
-                const media = await msg.downloadMedia();
+        // 2. Save Media Data
+        if (msg.hasMedia && config.SAVE_MEDIA) {
+            await fs.ensureDir(mediaPath);
+            const media = await msg.downloadMedia();
+            if (media) {
+                const ext = mime.extension(media.mimetype) || 'bin';
+                const fileName = `${msg.id.id}.${ext}`;
+                const fullPath = path.join(mediaPath, fileName);
                 
-                if (media) {
-                    const extension = mime.extension(media.mimetype) || 'bin';
-                    // Mark ViewOnce files in filename
-                    const prefix = msg.isViewOnce ? 'VIEWONCE_' : '';
-                    const filename = `${prefix}${msg.id.id}.${extension}`;
-                    const filePath = path.join(mediaDir, filename);
-
-                    if (!(await fs.pathExists(filePath))) {
-                        await fs.writeFile(filePath, media.data, 'base64');
-                        console.log(`💾 Media Saved: ${filename} to ${filenameBase}`);
-                    }
+                if (!(await fs.pathExists(fullPath))) {
+                    await fs.writeFile(fullPath, media.data, 'base64');
                 }
-            } catch (err) {
-                console.error(`❌ Failed to download media (${msg.id.id}):`, err.message);
             }
         }
-
-    } catch (error) {
-        console.error('Error processing message:', error.message);
+    } catch (e) {
+        // Silently catch errors for specific messages (e.g. expired media)
     }
 }
-// 2. Synchronization Logic
-async function syncRecentMessages() {
+
+// --- HELPERS ---
+async function checkDuplicate(file, id) {
+    if (!(await fs.pathExists(file))) return false;
     try {
-        const chats = await client.getChats();
-        console.log(`📂 Found ${chats.length} active chats. Syncing last ${config.SYNC_LIMIT || 50} messages each...`);
-
-        for (const chat of chats) {
-            if (chat.isGroup && !config.SAVE_GROUPS) continue;
-            
-            const limit = config.SYNC_LIMIT || 50; 
-            
-            // Fetches messages from the chat history
-            const messages = await chat.fetchMessages({ limit: limit });
-            
-            for (const msg of messages) {
-                await processMessage(msg); // Uses the main processor to save if not duplicate
-            }
-            
-            // Small delay to prevent banning/flooding
-            await new Promise(r => setTimeout(r, 500)); 
-        }
-    } catch (err) {
-        console.error('Sync Error:', err);
-    }
+        const data = await fs.readJson(file);
+        return data.some(m => m.id === id);
+    } catch { return false; }
 }
 
-// 3. Helper: Append safely to JSON
-async function appendToJson(filePath, newData) {
+async function appendToJson(file, entry) {
     let data = [];
-    try {
-        if (await fs.pathExists(filePath)) data = await fs.readJson(filePath);
-    } catch (err) { data = []; }
-    
-    // Check if the message is already the latest one (minor optimization)
-    if (data.length > 0 && data[data.length - 1].id === newData.id) return;
-
-    data.push(newData);
-    await fs.writeJson(filePath, data, { spaces: 2 });
+    if (await fs.pathExists(file)) {
+        try { data = await fs.readJson(file); } catch { data = []; }
+    }
+    data.push(entry);
+    await fs.writeJson(file, data, { spaces: 2 });
 }
 
-// 4. Helper: Check for duplicates
-async function checkDuplicate(filePath, msgId) {
-    try {
-        if (await fs.pathExists(filePath)) {
-            const data = await fs.readJson(filePath);
-            return data.some(m => m.id === msgId);
-        }
-    } catch (err) { return false; }
-    return false;
-}
-
-client.initialize();
+startBackup();
